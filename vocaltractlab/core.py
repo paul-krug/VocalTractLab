@@ -3,6 +3,9 @@
 
 import os
 import numpy as np
+import tempfile
+import subprocess
+import torchaudio
 
 import vocaltractlab_cython as cyvtl
 from vocaltractlab_cython.VocalTractLabApi import _close
@@ -14,6 +17,7 @@ from vocaltractlab_cython import gesture_file_to_motor_file
 from vocaltractlab_cython import phoneme_file_to_gesture_file
 from vocaltractlab_cython import synth_block
 from vocaltractlab_cython import tract_state_to_limited_tract_state
+from vocaltractlab_cython import tract_state_to_svg
 from vocaltractlab_cython import tract_state_to_transfer_function
 from vocaltractlab_cython import tract_state_to_tube_state
 #from vocaltractlab_cython.exceptions import VTLAPIError
@@ -31,8 +35,11 @@ from tools_mp import process
 from .utils import make_iterable
 from .audioprocessing import audio_to_f0
 from .audioprocessing import postprocess
+from .audioprocessing import to_float
 from .frequency_domain import TransferFunction
 from .tube_state import TubeState
+from .contour import svg_to_paths
+from .contour import plot_contours
 
 
 def active_speaker() -> str:
@@ -507,6 +514,211 @@ def _motor_to_audio(
     
     return audio
 
+def motor_to_contour(
+        x: Union[
+            MotorSequence,
+            MotorSeries,
+            SupraGlottalSequence,
+            SupraGlottalSeries,
+            str,
+            ],
+        image_dir: Optional[ str ] = None,
+        video_file: Optional[ str ] = None,
+        audio_file: Optional[ str ] = None,
+        fps: Optional[ int ] = None,
+        synthesize: bool = False,
+        workers: int = None,
+        verbose: bool = True,
+        ) -> np.ndarray:
+    
+    if synthesize:
+        if not isinstance( x, ( MotorSequence, MotorSeries ) ):
+            raise TypeError(
+                f"""
+                The option 'synthesize=True' is not supported 
+                for the input data type: '{type(x)}'
+                Type must be one of the following:
+                - MotorSequence
+                - MotorSeries
+                """
+                )
+        if audio_file is None:
+            audio = _motor_to_audio(
+                motor_data = x,
+                audio_file_path = None,
+                normalize_audio = -1,
+                sr = 44100,
+                state_samples = None,
+                )
+        else:
+            _motor_to_audio(
+                motor_data = x,
+                audio_file_path = audio_file,
+                normalize_audio = -1,
+                sr = 44100,
+                state_samples = None,
+                )
+            audio = audio_file
+    else:
+        audio = None
+    
+    def _plot_and_export( path_data, image_dir, video_file, audio ):
+        image_files = [
+            os.path.join( image_dir, f"input_{i}.png" )
+            for i in range( len( path_data ) )
+            ]
+        plot_contours(
+            path_sets = path_data,
+            out_files = image_files,
+            )
+        
+        if isinstance( audio, np.ndarray ):
+            audio_file = os.path.join( image_dir, 'synthesis.wav' )
+            torchaudio.save(
+                audio_file,
+                to_float( audio ),
+                44100,
+                )
+            audio_args = [
+                "-i", audio_file,       # Input audio
+                "-c:v", "copy",         # Copy video codec (no re-encoding)
+                "-c:a", "mp3",          # Set audio codec to AAC
+                "-strict", "experimental",  # Allow experimental AAC codec
+                "-b:a", "192k",         # Audio bitrate
+                "-shortest", 
+            ]
+        elif isinstance( audio, str ):
+            audio_args = [
+                "-i", audio,            # Input audio
+                "-c:v", "copy",         # Copy video codec (no re-encoding)
+                "-c:a", "mp3",          # Set audio codec to AAC
+                "-strict", "experimental",  # Allow experimental AAC codec
+                "-b:a", "192k",         # Audio bitrate
+                "-shortest", 
+            ]
+        elif audio is None:
+            audio_args = []
+
+        if video_file is not None:
+            subprocess.run([
+                'ffmpeg',
+                '-framerate', str(fps),
+                '-i', f'{image_dir}/input_%d.png',
+                *audio_args,
+                '-vf', f'crop=trunc(iw/2)*2:trunc(ih/2)*2',
+                '-pix_fmt', 'yuv420p',
+                '-vcodec', 'libx264',
+                #'-preset', 'ultrafast',
+                '-r', str(fps),
+                '-crf', '17',
+                '-y',
+                video_file,
+            ],cwd=os.getcwd())
+        return
+    
+    path_data = motor_to_contour_paths(
+        x = x,
+        fps = fps,
+        workers = workers,
+        verbose = verbose,
+        )
+    
+    if image_dir is not None:
+        _plot_and_export( path_data, image_dir, video_file, audio )
+    else:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _plot_and_export( path_data, temp_dir, video_file, audio )
+
+    return path_data
+
+def motor_to_contour_paths(
+        x: Union[
+            MotorSequence,
+            MotorSeries,
+            SupraGlottalSequence,
+            SupraGlottalSeries,
+            str,
+            ],
+        fps: Optional[ int ] = None,
+        workers: int = None,
+        verbose: bool = True,
+        ) -> np.ndarray:
+    
+    if isinstance( x, MotorSequence ):
+        ms = x.to_series()
+        sgs = ms.tract()
+    elif isinstance( x, MotorSeries ):
+        sgs = x.tract()
+    elif isinstance( x, SupraGlottalSequence ):
+        sgs = x.to_series()
+    elif isinstance( x, str ):
+        sgs = SupraGlottalSeries.load( x )
+    elif isinstance( x, SupraGlottalSeries ):
+        sgs = x
+    else:
+        raise TypeError(
+            f"""
+            The specified data type: '{type(x)}'
+            is not supported. Type must be one of the following:
+            - MotorSequence
+            - MotorSeries
+            - SupraGlottalSequence
+            - SupraGlottalSeries
+            - str
+            """
+            )
+    
+    tract_states = sgs.to_numpy( transpose = False )
+    # We use manual (drop-frame) resampling instead of sgs.resample().
+    # In videos in is not unsual to have frame rates of as low as 25-30 fps.
+    # The TargetSeries resampling may introduce small jitter at such low
+    # frame rates due to the sinc interpolation, which is not visually
+    # appealing. We use a simple drop-frame resampling to avoid this issue.
+    if fps is not None and sgs.sr is not None:
+        indices = []
+        for i in range( len( tract_states ) ):
+            idx = round( i * sgs.sr / fps )
+            if idx < len( tract_states ):
+                indices.append( idx )
+            else:
+                #print( f"Warning: Frame {i} exceeds the maximum number of frames." )
+                break
+        tract_states = tract_states[ indices ]
+
+    args = [
+        dict(
+            tract_state = ts,
+            )
+        for ts in tract_states
+        ]
+    
+    path_data = process(
+        _motor_to_contour_paths,
+        args = args,
+        return_data = True,
+        workers = workers,
+        verbose = verbose,
+        mp_threshold = 4,
+        initializer = load_speaker,
+        initargs = ( cyvtl.active_speaker(), ),
+        )
+    
+    return path_data
+
+def _motor_to_contour_paths(
+        tract_state: np.ndarray,
+        ):
+    tf = tempfile.NamedTemporaryFile()
+    tract_state_to_svg(
+        tract_state = tract_state,
+        svg_path = tf.name,
+        )
+    paths = svg_to_paths( tf.name )
+    tf.close()
+    return paths
+
+
+
 def motor_to_transfer_function(
         x: Union[
             MotorSequence,
@@ -580,14 +792,14 @@ def motor_to_tube(
             SupraGlottalSeries,
             str,
             ],
-	    save_tube_length: bool = True,
-	    save_tube_area: bool = True,
-	    save_tube_articulator: bool = True,
-	    save_incisor_position: bool = True,
-	    save_tongue_tip_side_elevation: bool = True,
-	    save_velum_opening: bool = True,
-	    fast_calculation = True,
-	    workers: int = None,
+        save_tube_length: bool = True,
+        save_tube_area: bool = True,
+        save_tube_articulator: bool = True,
+        save_incisor_position: bool = True,
+        save_tongue_tip_side_elevation: bool = True,
+        save_velum_opening: bool = True,
+        fast_calculation = True,
+        workers: int = None,
         verbose: bool = True,
         ) -> np.ndarray:
     
